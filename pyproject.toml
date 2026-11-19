@@ -133,6 +133,9 @@ exclude = [
 # next to its module.
 "flashinfer.experimental.deepgemm_dense_mqa" = ["*.json"]
 "flashinfer" = ["_build_meta.py", "mla_kv_pack_fp8_workloads.json"]
+# Measured envelopes of the specialized decode backend's kernels (one subpackage each),
+# read by backend="auto" (flashinfer/attention/specialized_decode/kernels/<name>/).
+"flashinfer.attention.specialized_decode" = ["kernels/*/*.json"]
 # The private loader imports this hyphenated source tree from package data.
 "flashinfer.moe_ep.kernel_src.sm100" = [
   "kimi-k3-megamoe/**/*.py",
@@ -249,6 +252,7 @@ exclude = [
   "flashinfer-jit-cache/",
   # CUTLASS DSL kernel bodies are compiler-lowered rather than ordinary Python.
   "flashinfer/attention/prims_ts/kernels/",
+  "flashinfer/cute_dsl/attention/gqa_decode_cluster_q7.py",
   # Imported CuTe DSL kernels are kept byte-faithful to their source.
   "flashinfer/experimental/attn_scores/kernels/selective_topk/",
   "3rdparty/",
@@ -326,6 +330,9 @@ extend-exclude = [
   "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",
+  # A hand-laid CuTe DSL kernel body (line layout kept as written); reflowing DSL code can
+  # also change traced semantics (see the GVR note above).
+  "flashinfer/cute_dsl/attention/gqa_decode_cluster_q7.py",
   # cuDNN Frontend sources vendored byte-faithfully for the Qwen 3.5 gated attention block (re-vendored as a clean
   # drop; the digests in its VENDOR_MANIFEST.json cover the files as written). The adapter beside it stays linted.
   "flashinfer/experimental/qwen_3_5_block/_cudnn_frost/",

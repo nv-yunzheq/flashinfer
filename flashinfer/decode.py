@@ -1449,7 +1449,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         backend : str
             The implementation backend, could be ``auto``/``fa2``/``fa3``/``trtllm-gen``/
-            ``cute-dsl``/``cudnn``. Defaults to ``auto``.
+            ``cute-dsl``/``cudnn``/``specialized``. Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability. On SM100 / SM103 with
             cudnn-frontend 1.30+ installed, ``auto`` resolves to ``cudnn`` for multi-token
@@ -1503,6 +1503,32 @@ class BatchDecodeWithPagedKVCacheWrapper:
             eligibility require a separate wrapper and graph capture. Eager
             warmups of such wrappers use their selected graph-mode route.
             ``workspace_size`` is unavailable for XQA-selected shapes.
+            The ``specialized`` backend holds kernels generated for one decode case each
+            (``flashinfer/attention/specialized_decode/kernels/``, one subpackage per
+            kernel); at :meth:`plan` the first kernel, in name order, whose case admits the
+            call serves it, and a plan no kernel serves raises ``NotImplementedError``.
+            Its kernel today is an SM103 CuTe DSL kernel for one
+            decode case: FP8-E4M3 Q and K/V with FP16 output,
+            16 query heads over 1 K/V head, head_dim 128, ``kv_layout="HND"``, page size
+            128, KV length <= 4352, batch 1..64, and ``q_len_per_req=7`` dense over the
+            block (``window_left=-1``, ``window_right=-1``), without RoPE, soft-cap,
+            sinks, LSE or tensor scales; other plans raise ``NotImplementedError``. K/V
+            may be the strided K and V views of one interleaved paged buffer
+            (``[pages, 1, 128, 2, 128]``, as vLLM allocates it). :meth:`plan` compiles the
+            configuration for the batch size and stages the KV lengths and a 34-page block
+            table (from ``block_tables`` or the CSR pages) in buffers the backend owns, so
+            :meth:`run` is CUDA-graph safe. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` at
+            :meth:`plan` keeps the call on the ``cute-dsl`` decode (64-token half pages of
+            the same pool). Counters: ``specialized_decode_stats()`` in
+            ``flashinfer.attention.specialized_decode`` (totals, and per kernel).
+            ``auto`` plans a call on ``specialized`` when the kill switch is off and a
+            kernel's case and measured envelope admit it; for the kernel above that is
+            a plan ``auto`` refused before (its ``window_right=-1``) on a 152-SM SM103
+            part (GB300) with every KV length >= ``q_len_per_req``. Any other plan keeps
+            its ``auto`` route, including a padded row with ``seq_len`` 0. Under ``use_cuda_graph=True`` the
+            first plan that takes a route freezes it (a later plan the other route would
+            serve raises ``ValueError``). ``auto`` has no autotuner here, so there is
+            nothing to autotune across backends.
 
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
@@ -1547,7 +1573,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         _check_kv_layout(kv_layout)
 
-        if backend in ("cute-dsl", "cudnn") and jit_args is not None:
+        if backend in ("cute-dsl", "cudnn", "specialized") and jit_args is not None:
             raise NotImplementedError(
                 f"{backend} backend does not support jit_args customization"
             )
@@ -1626,6 +1652,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._use_tensor_cores = use_tensor_cores or backend in (
             "trtllm-gen",
             "cute-dsl",
+            "specialized",
         )
         self._use_cuda_graph = use_cuda_graph
 
@@ -1646,6 +1673,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._requested_backend = backend
         self._cudnn_auto = False
         self._cudnn_auto_frozen: Optional[bool] = None
+        # backend="auto" planned on backend="specialized" (decided per plan; frozen under
+        # CUDA graphs once a plan takes a route, see _auto_takes_specialized)
+        self._specialized_auto = False
+        self._specialized_auto_frozen: Optional[bool] = None
 
         self._cute_dsl_wrapper = None
         if backend == "cute-dsl":
@@ -1653,6 +1684,20 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
             self._cute_dsl_wrapper = BatchDecodePagedCuteDSLWrapper(
                 float_workspace_buffer, use_cuda_graph=use_cuda_graph
+            )
+
+        self._specialized_decode = None
+        # the kernel backend="auto" chose for the last plan (see _auto_takes_specialized),
+        # and (the specialized backend's module, whether a kernel runs on this device)
+        self._specialized_auto_kernel: Optional[type] = None
+        self._specialized_auto_route: Optional[Tuple[Any, bool]] = None
+        if backend == "specialized":
+            from .attention.specialized_decode import SpecializedDecode
+
+            self._specialized_decode = SpecializedDecode(
+                float_workspace_buffer,
+                use_cuda_graph=use_cuda_graph,
+                fixed_batch_size=self._fixed_batch_size,
             )
 
         self._xqa_mtp_decode_frozen: Optional[bool] = None
@@ -1735,13 +1780,86 @@ class BatchDecodeWithPagedKVCacheWrapper:
             replay_hint=self.is_cuda_graph_enabled,
         )
 
+    def _auto_takes_specialized(
+        self,
+        indptr: torch.Tensor,
+        last_page_len: torch.Tensor,
+        seq_lens: Optional[torch.Tensor],
+        block_tables: Optional[torch.Tensor],
+        *,
+        window_right: int,
+        **case: Any,
+    ) -> Optional[type]:
+        """The ``backend="specialized"`` kernel this ``backend="auto"`` plan runs on, or
+        ``None`` for the ``auto`` route below.
+
+        The specialized backend decides (``flashinfer.attention.specialized_decode``
+        ``auto_kernel``): with the kill switch off, the first registered kernel (name
+        order) whose case and measured envelope admit the call; never raises. Under CUDA
+        graphs the route is frozen by the first plan that takes one (a specialized plan,
+        or a plan with ``window_right=0``, the only plans the ``auto`` route serves): a
+        later plan on a frozen ``auto`` route stays there, and a ``window_right=0`` plan
+        on a frozen specialized route raises (its captured graph replays the specialized
+        kernel). Nothing is decided at :meth:`run`.
+        """
+        if self._requested_backend != "auto" or self._jit_module is not None:
+            return None
+        route = self._specialized_auto_route
+        if (
+            route is None
+        ):  # once per wrapper: no kernel on this device -> nothing to ask
+            from .attention import specialized_decode
+
+            cc = tuple(get_compute_capability(self.device))
+            route = self._specialized_auto_route = (
+                specialized_decode,
+                any(
+                    cc in k.compute_capabilities
+                    for k in specialized_decode.registered_kernels().values()
+                ),
+            )
+        framework, has_kernel = route
+        kernel = None
+        if has_kernel:
+            kernel = framework.auto_kernel(
+                framework.DecodePlanCall(
+                    device=self.device,
+                    kv_layout=self._kv_layout,
+                    window_right=window_right,
+                    custom_jit=False,
+                    indptr=indptr,
+                    last_page_len=last_page_len,
+                    seq_lens=seq_lens,
+                    block_tables=block_tables,
+                    **case,
+                )
+            )
+        if not self.is_cuda_graph_enabled:
+            return kernel
+        frozen = self._specialized_auto_frozen
+        if frozen is None:
+            if kernel is not None:
+                self._specialized_auto_frozen = True
+            elif window_right == 0:
+                self._specialized_auto_frozen = False
+            return kernel
+        if frozen and kernel is None and window_right == 0:
+            raise ValueError(
+                "backend='auto' is part of the frozen cudagraph shape: this wrapper "
+                "was first planned on 'specialized' and this plan resolves to the auto "
+                "path; keep the mask, dtypes and q_len_per_req the same across plans, "
+                "or use a separate wrapper."
+            )
+        return kernel if frozen else None
+
     @property
     def resolved_backend(self) -> str:
         r"""The backend reported by this wrapper.
 
         The last :meth:`plan` resolves ``backend="auto"`` to ``"cudnn"``
         when the auto rule picked cuDNN, the tensor-core pick (``"fa2"`` / ``"fa3"``)
-        otherwise, ``"fa2"`` for the CUDA-core decode kernel. An explicit backend
+        otherwise, ``"fa2"`` for the CUDA-core decode kernel, ``"specialized"`` when
+        the plan took the specialized decode case. An explicit backend
         reports itself; a tensor-core ``auto`` wrapper reports ``"auto"`` before its
         first :meth:`plan`. An auto-selected XQA MTP plan reports ``"xqa"``;
         unsupported per-call options can still use the fallback. A wrapper built with
@@ -1749,6 +1867,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         """
         if self._batch_invariant is not None:
             return "batch_invariant"
+        if self._specialized_auto:
+            return "specialized"
         if getattr(self, "_use_xqa_mtp_decode", False):
             return "xqa"
         if self._cudnn_auto:
@@ -1952,7 +2072,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             disable_split_kv=disable_split_kv,
         ):
             backend = "cudnn"
-        if backend in ("cute-dsl", "trtllm-gen", "cudnn", "cutile"):
+        if backend in ("cute-dsl", "trtllm-gen", "cudnn", "cutile", "specialized"):
             raise NotImplementedError(
                 f"workspace_size is not available for decode backend {backend!r}"
             )
@@ -2471,9 +2591,45 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 )
         self._use_token_head_sf = use_token_head_sf
 
+        # backend="auto" takes backend="specialized" where one of its kernels admits the
+        # call inside its measured envelope (_auto_takes_specialized); every other plan
+        # resolves as below.
+        specialized_kernel = self._auto_takes_specialized(
+            indptr,
+            last_page_len,
+            seq_lens,
+            block_tables,
+            window_right=window_right,
+            batch_size=batch_size,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            q_len_per_req=q_len_per_req,
+            q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+            o_data_type=o_data_type,
+            pos_encoding_mode=pos_encoding_mode,
+            window_left=window_left,
+            logits_soft_cap=logits_soft_cap,
+            sm_scale=sm_scale,
+            fixed_split_size=-1 if fixed_split_size is None else fixed_split_size,
+            disable_split_kv=disable_split_kv,
+            use_token_head_sf=use_token_head_sf,
+        )
+        specialized_auto = specialized_kernel is not None
+        if specialized_auto and self._specialized_decode is None:
+            from .attention.specialized_decode import SpecializedDecode
+
+            self._specialized_decode = SpecializedDecode(
+                self._float_workspace_buffer,
+                use_cuda_graph=self._use_cuda_graph,
+                fixed_batch_size=self._fixed_batch_size,
+            )
+
         # backend="auto" may resolve to cudnn; decided per plan() so that the
         # q_len_per_req / buffer checks below already know the path.
-        cudnn_auto = self._auto_prefers_cudnn(
+        cudnn_auto = not specialized_auto and self._auto_prefers_cudnn(
             q_data_type,
             kv_data_type,
             o_data_type,
@@ -2501,8 +2657,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 "use use_tensor_cores=True with backend='fa2'."
             )
         # A rejected split option must leave the previous plan's route intact.
+        self._specialized_auto = specialized_auto
+        self._specialized_auto_kernel = specialized_kernel
         self._cudnn_auto = cudnn_auto
-        if self.is_cuda_graph_enabled:
+        if self.is_cuda_graph_enabled and not self._specialized_auto:
             # The resolved backend is part of the frozen CUDA-graph shape: a
             # captured graph replays the kernels it was captured with, and
             # those read the metadata buffers of one path only.
@@ -2519,10 +2677,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     "across plans, or use a separate wrapper."
                 )
             self._cudnn_auto_frozen = self._cudnn_auto
-        if window_right != 0 and self._backend != "cute-dsl":
+        if (
+            window_right != 0
+            and self._backend not in ("cute-dsl", "specialized")
+            and not self._specialized_auto
+        ):
             raise NotImplementedError(
                 "BatchDecodeWithPagedKVCacheWrapper only supports window_right != 0 "
-                "with backend='cute-dsl'"
+                "with backend='cute-dsl' or 'specialized'"
             )
 
         if q_len_per_req < 1:
@@ -2536,7 +2698,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
         if q_len_per_req > 1:
-            if not self.use_tensor_cores and not self._uses_cudnn:
+            if (
+                not self.use_tensor_cores
+                and not self._uses_cudnn
+                and not self._specialized_auto
+            ):
                 raise ValueError(
                     "q_len_per_req > 1 requires tensor-core decode "
                     "(use_tensor_cores=True or the trtllm-gen/cute-dsl/cudnn backend)."
@@ -2699,6 +2865,53 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     f"request with kv_len={min_kv_len}: its earlier rows "
                     "would attend to an empty KV range."
                 )
+        if self._backend == "specialized" or self._specialized_auto:
+            self._specialized_decode.plan(
+                self._specialized_decode.call_type(
+                    device=self.device,
+                    kv_layout=self._kv_layout,
+                    batch_size=batch_size,
+                    num_qo_heads=num_qo_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    page_size=page_size,
+                    q_len_per_req=q_len_per_req,
+                    q_data_type=q_data_type,
+                    kv_data_type=kv_data_type,
+                    o_data_type=o_data_type,
+                    pos_encoding_mode=pos_encoding_mode,
+                    window_left=window_left,
+                    window_right=window_right,
+                    logits_soft_cap=logits_soft_cap,
+                    sm_scale=sm_scale,
+                    fixed_split_size=fixed_split_size,
+                    disable_split_kv=disable_split_kv,
+                    use_token_head_sf=use_token_head_sf,
+                    custom_jit=self._jit_module is not None,
+                    indptr=self._paged_kv_indptr_buf,
+                    indices=self._paged_kv_indices_buf,
+                    last_page_len=self._paged_kv_last_page_len_buf,
+                    seq_lens=seq_lens,
+                    block_tables=block_tables,
+                    kv_lens=kv_lens_arr_host,
+                ),
+                non_blocking=non_blocking,
+                kernel=self._specialized_auto_kernel
+                if self._specialized_auto
+                else None,
+                selected_by_auto=self._specialized_auto,
+            )
+            self._plan_info = None
+            self._pos_encoding_mode = pos_encoding_mode
+            self._window_left = window_left
+            self._window_right = window_right
+            self._logits_soft_cap = logits_soft_cap
+            self._sm_scale = sm_scale
+            self._rope_scale = rope_scale
+            self._rope_theta = rope_theta
+            self._q_len_per_req = q_len_per_req
+            self._is_causal = is_causal
+            return
         if self._backend == "cutile":
             # Pure cuda.tile Python kernel: no C++ module to JIT. Stash the
             # per-sequence KV lengths and page size, and materialize the dense
@@ -3401,6 +3614,26 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 kv_cache_sf=kv_cache_sf,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 enable_pdl=enable_pdl,
+            )
+
+        if self._backend == "specialized" or self._specialized_auto:
+            return self._specialized_decode.run(
+                q,
+                k_cache,
+                v_cache,
+                out=out,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                enable_pdl=enable_pdl,
+                positional_args=args,
+                return_lse=return_lse,
+                lse=lse,
+                sinks=sinks,
+                kv_cache_sf=kv_cache_sf,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                window_left=window_left,
+                q_len_per_req=q_len_per_req,
             )
 
         if getattr(self, "_use_token_head_sf", False):
