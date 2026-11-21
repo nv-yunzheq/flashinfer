@@ -63,6 +63,9 @@ class KernelSpec:
     )
     # the auto-route case that IS the kernel's case (auto takes it inside the envelope)
     in_case: str = "in_case"
+    # device-to-host copies one plan() of the served call makes with every plan tensor on the
+    # device (the per-request KV lengths, read once)
+    plan_host_reads: int = 1
     checks: Tuple[Check, ...] = ()
 
     # -- hooks every spec implements -------------------------------------

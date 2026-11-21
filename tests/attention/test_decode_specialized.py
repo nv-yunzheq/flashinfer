@@ -577,6 +577,41 @@ def test_off_case_runs_raise(spec, case, monkeypatch):
         spec.run(w, c, **run_kwargs)
 
 
+def _count_device_to_host_copies(fn) -> Optional[int]:
+    """Device-to-host memcpys while ``fn`` runs (CUDA profiler); None without one."""
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    names = [e.name for e in prof.events()]
+    if not any("Memcpy" in n for n in names):  # plan() always copies host -> device
+        return None
+    return sum("Memcpy DtoH" in n for n in names)
+
+
+@pytest.mark.parametrize("backend", ("specialized", "auto"))
+@pytest.mark.parametrize("name", NAMES)
+def test_plan_reads_the_kv_lengths_once(spec, backend, monkeypatch):
+    """A plan with every plan tensor on the device copies the per-request KV lengths to the
+    host once: the auto decision's read is the plan's read, and the specialized route does
+    not read the CSR metadata it does not use."""
+    if backend == "auto":
+        _needs_envelope(spec)
+    else:
+        _needs_kernel(spec)
+    monkeypatch.delenv(KILL_SWITCH_ENV, raising=False)
+    c = spec.case(spec.lens(8, seed=13), seed=13)
+    w = spec.wrapper(c, backend=backend)  # first plan: compiles
+    assert w.resolved_backend == "specialized"
+    reads = _count_device_to_host_copies(lambda: spec.plan(w, c))
+    if reads is None:
+        pytest.skip("the CUDA profiler records no memcpy here")
+    assert reads == spec.plan_host_reads
+    spec.check_close(spec.run(w, c), spec.reference(c))
+
+
 # =========================================== inside the measured envelope: backend="auto"
 
 

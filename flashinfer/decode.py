@@ -1691,6 +1691,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         # and (the specialized backend's module, whether a kernel runs on this device)
         self._specialized_auto_kernel: Optional[type] = None
         self._specialized_auto_route: Optional[Tuple[Any, bool]] = None
+        # host KV lengths read by the last plan's auto decision (see _auto_takes_specialized)
+        self._auto_kv_lens_host: Optional[torch.Tensor] = None
         if backend == "specialized":
             from .attention.specialized_decode import SpecializedDecode
 
@@ -1800,8 +1802,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         or a plan with ``window_right=0``, the only plans the ``auto`` route serves): a
         later plan on a frozen ``auto`` route stays there, and a ``window_right=0`` plan
         on a frozen specialized route raises (its captured graph replays the specialized
-        kernel). Nothing is decided at :meth:`run`.
+        kernel). Nothing is decided at :meth:`run`. The host KV lengths the decision
+        read are kept in ``self._auto_kv_lens_host`` for this plan.
         """
+        self._auto_kv_lens_host = None
         if self._requested_backend != "auto" or self._jit_module is not None:
             return None
         route = self._specialized_auto_route
@@ -1821,19 +1825,21 @@ class BatchDecodeWithPagedKVCacheWrapper:
         framework, has_kernel = route
         kernel = None
         if has_kernel:
-            kernel = framework.auto_kernel(
-                framework.DecodePlanCall(
-                    device=self.device,
-                    kv_layout=self._kv_layout,
-                    window_right=window_right,
-                    custom_jit=False,
-                    indptr=indptr,
-                    last_page_len=last_page_len,
-                    seq_lens=seq_lens,
-                    block_tables=block_tables,
-                    **case,
-                )
+            call = framework.DecodePlanCall(
+                device=self.device,
+                kv_layout=self._kv_layout,
+                window_right=window_right,
+                custom_jit=False,
+                indptr=indptr,
+                last_page_len=last_page_len,
+                seq_lens=seq_lens,
+                block_tables=block_tables,
+                **case,
             )
+            kernel = framework.auto_kernel(call)
+            # the host KV lengths the decision read (if it read them), so the plan does
+            # not read them from the device a second time
+            self._auto_kv_lens_host = call.kv_lens
         if not self.is_cuda_graph_enabled:
             return kernel
         frozen = self._specialized_auto_frozen
@@ -2756,8 +2762,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self.device, non_blocking=non_blocking
             )
 
-        indptr_host = indptr.to("cpu")
-        last_page_len_host = last_page_len.to("cpu")
+        # Host copies of the plan metadata: one device-to-host read per tensor. The
+        # specialized route needs only the per-request KV lengths, so when they come from
+        # seq_lens (or the auto decision already read them) the CSR metadata stays on the
+        # device; every other route reads it as before.
+        decided_kv_lens = self._auto_kv_lens_host
+        specialized_route = self._backend == "specialized" or self._specialized_auto
+        if specialized_route and (seq_lens is not None or decided_kv_lens is not None):
+            indptr_host: Optional[torch.Tensor] = None
+            last_page_len_host: Optional[torch.Tensor] = None
+        else:
+            indptr_host = indptr.to("cpu")
+            last_page_len_host = last_page_len.to("cpu")
 
         if fixed_split_size is not None and not self.use_tensor_cores:
             raise ValueError(
@@ -2776,7 +2792,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._user_block_tables = block_tables is not None
         self._max_kv_len: Optional[int] = None
 
-        if seq_lens is None:
+        if decided_kv_lens is not None:
+            # read by the auto decision from the same seq_lens / CSR metadata
+            kv_lens_arr_host = decided_kv_lens
+        elif seq_lens is None:
+            assert indptr_host is not None and last_page_len_host is not None
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
         else:
             kv_lens_arr_host = seq_lens.cpu().to(torch.int32)
@@ -2839,6 +2859,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 kv_lens_arr_host, non_blocking=non_blocking
             )
             if self._block_tables is None:
+                if indptr_host is None:
+                    indptr_host = indptr.to("cpu")
                 self._block_tables = _make_block_tables_from_indptr(
                     indptr_host,
                     self._paged_kv_indices_buf,
@@ -2912,6 +2934,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._q_len_per_req = q_len_per_req
             self._is_causal = is_causal
             return
+        # every route below read the CSR metadata to the host above
+        assert indptr_host is not None and last_page_len_host is not None
         if self._backend == "cutile":
             # Pure cuda.tile Python kernel: no C++ module to JIT. Stash the
             # per-sequence KV lengths and page size, and materialize the dense
