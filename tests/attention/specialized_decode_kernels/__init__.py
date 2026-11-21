@@ -96,6 +96,11 @@ class KernelSpec:
     def plan(self, wrapper, case, **kwargs) -> None:
         raise NotImplementedError
 
+    def plan_call(self, wrapper, case, **kwargs) -> Callable[[], None]:
+        """``plan`` as a zero-argument call, everything it needs built beforehand (the
+        host-read count times only the call)."""
+        raise NotImplementedError
+
     def run(self, wrapper, case, out=None, **kwargs) -> Any:
         raise NotImplementedError
 

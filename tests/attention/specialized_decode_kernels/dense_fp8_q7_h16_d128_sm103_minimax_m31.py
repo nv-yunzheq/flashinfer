@@ -135,7 +135,8 @@ def assert_close(out, ref, row_tol=0.08, min_cos=0.999):
     assert float(cos) >= min_cos
 
 
-def plan(wrapper, case_, *, table=True, **overrides):
+def plan_call(wrapper, case_, *, table=True, **overrides):
+    """``wrapper.plan`` of ``case_`` as a zero-argument call, its metadata built beforehand."""
     _, _, _, seq_lens, block_tables = case_
     indptr, indices, last = csr(seq_lens, block_tables)
     kwargs = dict(
@@ -149,7 +150,11 @@ def plan(wrapper, case_, *, table=True, **overrides):
         block_tables=block_tables if table else None,
     )
     kwargs.update(overrides)
-    wrapper.plan(indptr, indices, last, HEADS, 1, D, PAGE, **kwargs)
+    return lambda: wrapper.plan(indptr, indices, last, HEADS, 1, D, PAGE, **kwargs)
+
+
+def plan(wrapper, case_, *, table=True, **overrides):
+    plan_call(wrapper, case_, table=table, **overrides)()
 
 
 def wrapper(
@@ -266,6 +271,9 @@ class Spec(KernelSpec):
 
     def plan(self, w, case_, **kwargs):
         plan(w, case_, **kwargs)
+
+    def plan_call(self, w, case_, **kwargs):
+        return plan_call(w, case_, **kwargs)
 
     def run(self, w, case_, out=None, **kwargs):
         return run(w, case_, out, **kwargs)

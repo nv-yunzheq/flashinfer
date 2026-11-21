@@ -605,7 +605,7 @@ def test_plan_reads_the_kv_lengths_once(spec, backend, monkeypatch):
     c = spec.case(spec.lens(8, seed=13), seed=13)
     w = spec.wrapper(c, backend=backend)  # first plan: compiles
     assert w.resolved_backend == "specialized"
-    reads = _count_device_to_host_copies(lambda: spec.plan(w, c))
+    reads = _count_device_to_host_copies(spec.plan_call(w, c))
     if reads is None:
         pytest.skip("the CUDA profiler records no memcpy here")
     assert reads == spec.plan_host_reads
